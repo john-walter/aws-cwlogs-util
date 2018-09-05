@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/external"
 	"github.com/aws/aws-sdk-go-v2/aws/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
@@ -21,9 +22,16 @@ var waitGroup = sync.WaitGroup{}
 var timeOffset = -int64(60 * 1000)
 var trueRef = true
 
-func getLogStreams(logGroupName string, logStreamLike string, initialStartTime int64) []string {
+func getCredentials(cfg aws.Config) bool {
+	var err error
+	if cfg.Credentials != nil {
+		_, err = cfg.Credentials.Retrieve()
+	}
+	return err == nil
+}
+
+func getLogStreams(logGroupName string, logStreamMatcher regexp.Regexp, initialStartTime int64) []string {
 	logStreamNames := []string{}
-	logStreamMatcher := regexp.MustCompile(strings.Replace(logStreamLike, "*", ".*", -1))
 	logStreamMinTimestamp := initialStartTime + -int64(1000 * 60 * 60)
 	describeLogStreamsInput := cloudwatchlogs.DescribeLogStreamsInput{LogGroupName: &logGroupName, OrderBy: cloudwatchlogs.OrderByLastEventTime, Descending: &trueRef}
 	describeLogStreamsRequest := logsClient.DescribeLogStreamsRequest(&describeLogStreamsInput)
@@ -56,12 +64,12 @@ func getLogStreams(logGroupName string, logStreamLike string, initialStartTime i
 
 func main() {
 	stscreds.DefaultDuration = time.Minute * 60
-	profileInput := flag.String("profile", "", "An AWS credential profile (https://docs.aws.amazon.com/cli/latest/userguide/cli-multiple-profiles.html)")
+	profileInput := flag.String("profile", "", "An AWS credential profile (refer to https://docs.aws.amazon.com/cli/latest/userguide/cli-multiple-profiles.html)")
 	regionInput := flag.String("region", "us-east-1", "The AWS region associated with the target log group")
 	logGroupNameInput := flag.String("log-group-name", "", "An AWS log group that may or may not exist at runtime (polling will continue to occur)")
 	logStreamLikeInput := flag.String("log-stream-like", "*", "Target log stream names that match this expression")
 	logStreamRefreshInput := flag.Bool("log-stream-refresh", false, "Perform refreshes of target log streams")
-	filterPatternInput := flag.String("filter-pattern", "", "A valid CloudWatch log filter (https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/FilterAndPatternSyntax.html)")
+	filterPatternInput := flag.String("filter-pattern", "", "A valid CloudWatch log filter (refer to https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/FilterAndPatternSyntax.html)")
 	startTimeInput := flag.String("start-time", time.Now().UTC().Format("2006-01-02T15:04:05Z"), "Events that occurred after this time are returned")
 	endTimeInput := flag.String("end-time", "", "Events that occurred at or before this time are returned")
 	helpInput := flag.Bool("help", false, "Show usage message")
@@ -71,6 +79,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	logStreamMatcher := regexp.MustCompile(strings.Replace(*logStreamLikeInput, "*", ".*", -1))
+
 	startTime, _ := time.Parse(time.RFC3339, *startTimeInput)
 
 	cfg, _ := external.LoadDefaultAWSConfig(
@@ -79,12 +89,14 @@ func main() {
 		external.WithRegion(*regionInput),
 	)
 
-	_, credFail := cfg.Credentials.Retrieve()
-
-	if &cfg != nil && credFail == nil {
+	if &cfg != nil && getCredentials(cfg) {
 		logsClient = *cloudwatchlogs.New(cfg)
 	} else {
-		fmt.Println("Bad credentials were provided.")
+		additionalProfileHelp := ""
+		if *profileInput != "" {
+			additionalProfileHelp = " Ensure that your credential profile \"" + *profileInput + "\" has been properly configured (refer to https://docs.aws.amazon.com/cli/latest/userguide/cli-multiple-profiles.html)."
+		}
+		fmt.Println("Bad credentials were provided." + additionalProfileHelp)
 		os.Exit(1)
 	}
 
@@ -105,7 +117,7 @@ func main() {
 		endTimeUnix = time.Now().UTC().Unix() * 1000 + timeOffset
 	}
 	var filterLogEventsError error
-	logStreamNames := getLogStreams(*logGroupNameInput, *logStreamLikeInput, initialStartTimeUnix)
+	logStreamNames := getLogStreams(*logGroupNameInput, *logStreamMatcher, initialStartTimeUnix)
 	for true {
 		for i := 0; i < len(logStreamNames); i += 100 {
 			endOfRange := i + 99
@@ -134,7 +146,7 @@ func main() {
 			startTimeUnix = endTimeUnix + 1000
 			filterLogEventsInput.StartTime = &startTimeUnix
 			if *logStreamRefreshInput {
-				logStreamNames = getLogStreams(*logGroupNameInput, *logStreamLikeInput, initialStartTimeUnix)
+				logStreamNames = getLogStreams(*logGroupNameInput, *logStreamMatcher, initialStartTimeUnix)
 			}
 			// accumulate at least a 5 second interval before requesting a new set of logs
 			for endTimeUnix - startTimeUnix < 5000 {
