@@ -3,7 +3,7 @@
 A simple utility meant for "live tailing" and/or viewing CloudWatch logs produced during a given time range.
 
 ### Features
-* View logs produced during a given time range or leave "--end-time" undefined to view events
+* View logs produced during a given time range or leave "--end-time" undefined to tail events
 * Target a subset of log streams using a regex pattern
 * Allows you to continuously refresh log streams during runtime
 
