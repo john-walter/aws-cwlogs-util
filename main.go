@@ -30,34 +30,34 @@ func getCredentials(cfg aws.Config) bool {
 	return err == nil
 }
 
-func getLogStreams(logGroupName string, logStreamMatcher regexp.Regexp, initialStartTime int64) []string {
+func getLogStreams(logGroupName string, logStreamMatcher regexp.Regexp, minEventTime int64, maxEventTime int64) []string {
 	logStreamNames := []string{}
-	logStreamMinTimestamp := initialStartTime + -int64(1000 * 60 * 60)
-	describeLogStreamsInput := cloudwatchlogs.DescribeLogStreamsInput{LogGroupName: &logGroupName, OrderBy: cloudwatchlogs.OrderByLastEventTime, Descending: &trueRef}
+	logStreamMinTimestamp := minEventTime - (60 * 60 * 1000 * 3)
+	logStreamMaxTimestamp := maxEventTime
+	describeLogStreamsInput := cloudwatchlogs.DescribeLogStreamsInput{LogGroupName: &logGroupName, OrderBy: cloudwatchlogs.OrderByLastEventTime}
 	describeLogStreamsRequest := logsClient.DescribeLogStreamsRequest(&describeLogStreamsInput)
 	describeLogStreamsRequestIter := describeLogStreamsRequest.Paginate()
-	encounteredEarlierTimestamp := false
+	encounteredLaterTimestamp := false
 	// keep trying to receive log stream names until we complete a pagination cycle with no errors
-	for true {
-		for describeLogStreamsRequestIter.Next() && !encounteredEarlierTimestamp {
-			describeLogStreamsRequestPage := describeLogStreamsRequestIter.CurrentPage()
-			for _, item := range describeLogStreamsRequestPage.LogStreams {
-				// include any log streams that have received events in the last three hours
-				if logStreamMinTimestamp <= *item.LastEventTimestamp {
-					logStreamMatches := logStreamMatcher.FindAllStringIndex(*item.LogStreamName, -1)
-					if 0 < len(logStreamMatches) {
-						logStreamNames = append(logStreamNames, *item.LogStreamName)
-					}
-				} else {
-					encounteredEarlierTimestamp = true
+	for !encounteredLaterTimestamp && describeLogStreamsRequestIter.Next() {
+		describeLogStreamsRequestPage := describeLogStreamsRequestIter.CurrentPage()
+		for _, item := range describeLogStreamsRequestPage.LogStreams {
+			if item.LastEventTimestamp == nil { continue }
+			
+			if logStreamMinTimestamp <= *item.LastEventTimestamp && *item.LastEventTimestamp < logStreamMaxTimestamp {
+				logStreamMatches := logStreamMatcher.FindAllStringIndex(*item.LogStreamName, -1)
+				if 0 < len(logStreamMatches) {
+					logStreamNames = append(logStreamNames, *item.LogStreamName)
 				}
-			}
-			if describeLogStreamsRequestIter.Err() != nil {
-				time.Sleep(time.Second * 5)
-				break
+			} else if logStreamMaxTimestamp <= *item.LastEventTimestamp {
+				encounteredLaterTimestamp = true
 			}
 		}
-		if describeLogStreamsRequestIter.Err() == nil { break }
+		if describeLogStreamsRequestIter.Err() != nil {
+			time.Sleep(time.Second * 5)
+		} else if describeLogStreamsRequestPage.NextToken == nil {
+			break
+		}
 	}
 	return logStreamNames
 }
@@ -100,7 +100,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	startTimeUnix := startTime.UTC().Unix() * 1000 + (timeOffset * 2)
+	startTimeUnix := startTime.UTC().Unix() * 1000
 	initialStartTimeUnix := startTimeUnix
 
 	filterLogEventsInput := cloudwatchlogs.FilterLogEventsInput{LogGroupName: logGroupNameInput, StartTime: &startTimeUnix}
@@ -112,13 +112,14 @@ func main() {
 	if *endTimeInput != "" {
 		endTime, _ := time.Parse(time.RFC3339, *endTimeInput)
 		endTimeUnix = endTime.UTC().Unix() * 1000
-		filterLogEventsInput.EndTime = &endTimeUnix
 	} else {
 		endTimeUnix = time.Now().UTC().Unix() * 1000 + timeOffset
 	}
+	filterLogEventsInput.EndTime = &endTimeUnix
+
 	var filterLogEventsError error
-	logStreamNames := getLogStreams(*logGroupNameInput, *logStreamMatcher, initialStartTimeUnix)
-	for true {
+	logStreamNames := getLogStreams(*logGroupNameInput, *logStreamMatcher, initialStartTimeUnix, endTimeUnix)
+	for 0 < len(logStreamNames) || *endTimeInput == "" {
 		for i := 0; i < len(logStreamNames); i += 100 {
 			endOfRange := i + 99
 			if len(logStreamNames) - 1 < endOfRange {
@@ -144,16 +145,15 @@ func main() {
 		waitGroup.Wait()
 		if filterLogEventsError == nil && *endTimeInput == "" {
 			startTimeUnix = endTimeUnix + 1000
-			filterLogEventsInput.StartTime = &startTimeUnix
-			if *logStreamRefreshInput {
-				logStreamNames = getLogStreams(*logGroupNameInput, *logStreamMatcher, initialStartTimeUnix)
-			}
-			// accumulate at least a 5 second interval before requesting a new set of logs
-			for endTimeUnix - startTimeUnix < 5000 {
+			for endTimeUnix <= startTimeUnix {
 				time.Sleep(time.Second)
-				endTimeUnix = time.Now().UTC().Unix() * 1000 + timeOffset
+				endTimeUnix = (endTimeUnix * 1000) + timeOffset + 1000
 			}
+			filterLogEventsInput.StartTime = &startTimeUnix
 			filterLogEventsInput.EndTime = &endTimeUnix
+			if *logStreamRefreshInput {
+				logStreamNames = getLogStreams(*logGroupNameInput, *logStreamMatcher, initialStartTimeUnix, endTimeUnix)
+			}
 		} else {
 			break
 		}
