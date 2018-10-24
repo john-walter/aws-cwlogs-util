@@ -18,10 +18,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 )
 
-// maintain an artifical time offset (in seconds) so we can view log events ingested in realtime, but might have an earlier event timestamp up to this value in the past
-var timeOffset = -int64(60 * 1000)
-var trueRef = true
-
 func checkCredentials(cfg aws.Config) error {
 	var err error
 	if cfg.Credentials != nil {
@@ -30,13 +26,15 @@ func checkCredentials(cfg aws.Config) error {
 	return err
 }
 
-func getLogStreams(logger *log.Logger, logsClient *cloudwatchlogs.CloudWatchLogs, logGroupName string, logStreamMatcher regexp.Regexp, logStreamPrefix string, initialStartTime int64) ([]string, error) {
-	logStreamNames := []string{}
+func getLogStreams(logger *log.Logger, logsClient *cloudwatchlogs.CloudWatchLogs, logGroupName string, logStreamMatcher *regexp.Regexp, logStreamPrefix string, initialStartTime int64) ([]string, error) {
+	var logStreamNames []string
 	logStreamMinTimestamp := initialStartTime - int64(3*60*60*1000) // 3 hour
 	describeLogStreamsInput := cloudwatchlogs.DescribeLogStreamsInput{LogGroupName: &logGroupName}
 	if len(logStreamPrefix) != 0 {
 		describeLogStreamsInput.LogStreamNamePrefix = &logStreamPrefix
 	} else {
+		var trueRef = true
+
 		describeLogStreamsInput.OrderBy = cloudwatchlogs.OrderByLastEventTime
 		describeLogStreamsInput.Descending = &trueRef
 	}
@@ -46,7 +44,7 @@ func getLogStreams(logger *log.Logger, logsClient *cloudwatchlogs.CloudWatchLogs
 	logger.Print("Fetching new set of streams")
 	// keep trying to receive log stream names until we complete a pagination cycle with no errors
 	matched := map[string]bool{}
-	for true {
+	for {
 		found := false
 		for describeLogStreamsRequestIter.Next() {
 			fmt.Printf(".")
@@ -74,11 +72,11 @@ func getLogStreams(logger *log.Logger, logsClient *cloudwatchlogs.CloudWatchLogs
 	return logStreamNames, nil
 }
 
-type Msg []cloudwatchlogs.FilteredLogEvent
+type msg []cloudwatchlogs.FilteredLogEvent
 
-func (m Msg) Len() int           { return len(m) }
-func (m Msg) Swap(i, j int)      { m[i], m[j] = m[j], m[i] }
-func (m Msg) Less(i, j int) bool { return *m[i].IngestionTime < *m[j].IngestionTime }
+func (m msg) Len() int           { return len(m) }
+func (m msg) Swap(i, j int)      { m[i], m[j] = m[j], m[i] }
+func (m msg) Less(i, j int) bool { return *m[i].IngestionTime < *m[j].IngestionTime }
 
 func main() {
 
@@ -113,7 +111,7 @@ func main() {
 		logger.Fatalf("Failed LoadDefaultAWSConfig: %s", err.Error())
 	}
 
-	if err := checkCredentials(cfg); err != nil {
+	if err = checkCredentials(cfg); err != nil {
 		logger.Fatalf(`Ensure that your credential profile %s has been properly configured (refer to https://docs.aws.amazon.com/cli/latest/userguide/cli-multiple-profiles.html).`, *profileInput)
 	}
 
@@ -131,7 +129,7 @@ func main() {
 
 	startTime = toTime(*startTimeInput, time.Now())
 
-	endTime = toTime(*endTimeInput, startTime.Add(24 * time.Hour))
+	endTime = toTime(*endTimeInput, startTime.Add(24*time.Hour))
 
 	startTimeUnix = startTime.UTC().UnixNano() / (1000 * 1000)
 	endTimeUnix = endTime.UTC().UnixNano() / (1000 * 1000)
@@ -158,7 +156,11 @@ func main() {
 
 		if time.Since(start) > (5 * time.Minute) {
 			start = time.Now()
-			filterLogEventsInput.LogStreamNames, err = getLogStreams(logger, logsClient, *logGroupNameInput, *logStreamMatcher, *logStreamPrefix, startTimeUnix)
+			filterLogEventsInput.LogStreamNames, err = getLogStreams(logger, logsClient, *logGroupNameInput, logStreamMatcher, *logStreamPrefix, startTimeUnix)
+			if err != nil {
+				time.Sleep(5 * time.Second)
+				continue
+			}
 		}
 		filterLogEventsRequest := logsClient.FilterLogEventsRequest(&filterLogEventsInput)
 		filterLogEventsRequestIter := filterLogEventsRequest.Paginate()
@@ -175,7 +177,7 @@ func main() {
 		}(&filterLogEventsRequestIter)
 
 		var latest int64
-		var output = []cloudwatchlogs.FilteredLogEvent{}
+		var output []cloudwatchlogs.FilteredLogEvent
 		for row := range all {
 			if *row.Timestamp > latest {
 				latest = *row.Timestamp
@@ -183,7 +185,7 @@ func main() {
 			output = append(output, row)
 		}
 
-		sort.Sort(Msg(output))
+		sort.Sort(msg(output))
 		for _, o := range output {
 			p := strings.Split(*o.LogStreamName, "/")
 			logger.Printf("%-30s  %s\n", strings.Join(p[:1], "/"), *o.Message)
