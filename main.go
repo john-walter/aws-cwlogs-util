@@ -3,159 +3,224 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"regexp"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/external"
 	"github.com/aws/aws-sdk-go-v2/aws/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
-	"log"
-	"os"
-	"regexp"
-	"strings"
-	"sync"
-	"time"
 )
 
-var logsClient = cloudwatchlogs.CloudWatchLogs{}
-var logger = log.New(os.Stdout, "", 0)
-var waitGroup = sync.WaitGroup{}
 // maintain an artifical time offset (in seconds) so we can view log events ingested in realtime, but might have an earlier event timestamp up to this value in the past
 var timeOffset = -int64(60 * 1000)
 var trueRef = true
 
-func getCredentials(cfg aws.Config) bool {
+func checkCredentials(cfg aws.Config) error {
 	var err error
 	if cfg.Credentials != nil {
 		_, err = cfg.Credentials.Retrieve()
 	}
-	return err == nil
+	return err
 }
 
-func getLogStreams(logGroupName string, logStreamMatcher regexp.Regexp, minEventTime int64, maxEventTime int64) []string {
+func getLogStreams(logger *log.Logger, logsClient *cloudwatchlogs.CloudWatchLogs, logGroupName string, logStreamMatcher regexp.Regexp, logStreamPrefix string, initialStartTime int64) ([]string, error) {
 	logStreamNames := []string{}
-	logStreamMinTimestamp := minEventTime - (60 * 60 * 1000 * 3)
-	logStreamMaxTimestamp := maxEventTime
-	describeLogStreamsInput := cloudwatchlogs.DescribeLogStreamsInput{LogGroupName: &logGroupName, OrderBy: cloudwatchlogs.OrderByLastEventTime}
+	logStreamMinTimestamp := initialStartTime - int64(3*60*60*1000) // 3 hour
+	describeLogStreamsInput := cloudwatchlogs.DescribeLogStreamsInput{LogGroupName: &logGroupName}
+	if len(logStreamPrefix) != 0 {
+		describeLogStreamsInput.LogStreamNamePrefix = &logStreamPrefix
+	} else {
+		describeLogStreamsInput.OrderBy = cloudwatchlogs.OrderByLastEventTime
+		describeLogStreamsInput.Descending = &trueRef
+	}
 	describeLogStreamsRequest := logsClient.DescribeLogStreamsRequest(&describeLogStreamsInput)
 	describeLogStreamsRequestIter := describeLogStreamsRequest.Paginate()
-	encounteredLaterTimestamp := false
+
+	logger.Print("Fetching new set of streams")
 	// keep trying to receive log stream names until we complete a pagination cycle with no errors
-	for !encounteredLaterTimestamp && describeLogStreamsRequestIter.Next() {
-		describeLogStreamsRequestPage := describeLogStreamsRequestIter.CurrentPage()
-		for _, item := range describeLogStreamsRequestPage.LogStreams {
-			if item.LastEventTimestamp == nil { continue }
-			
-			if logStreamMinTimestamp <= *item.LastEventTimestamp && *item.LastEventTimestamp < logStreamMaxTimestamp {
-				logStreamMatches := logStreamMatcher.FindAllStringIndex(*item.LogStreamName, -1)
-				if 0 < len(logStreamMatches) {
-					logStreamNames = append(logStreamNames, *item.LogStreamName)
+	matched := map[string]bool{}
+	for true {
+		found := false
+		for describeLogStreamsRequestIter.Next() {
+			fmt.Printf(".")
+			for _, item := range describeLogStreamsRequestIter.CurrentPage().LogStreams {
+				// include any log streams that start in last 3 hours, or finished after start time
+				if logStreamMinTimestamp <= *item.FirstEventTimestamp || *item.LastEventTimestamp >= initialStartTime {
+					logStreamMatches := logStreamMatcher.FindAllStringIndex(*item.LogStreamName, -1)
+					if 0 < len(logStreamMatches) && !matched[*item.LogStreamName] {
+						logStreamNames = append(logStreamNames, *item.LogStreamName)
+						matched[*item.LogStreamName] = true
+						found = true
+					}
 				}
-			} else if logStreamMaxTimestamp <= *item.LastEventTimestamp {
-				encounteredLaterTimestamp = true
+			}
+			if describeLogStreamsRequestIter.Err() != nil {
+				logger.Printf("Error getting streams: %s", describeLogStreamsRequestIter.Err().Error())
+				break
 			}
 		}
-		if describeLogStreamsRequestIter.Err() != nil {
-			time.Sleep(time.Second * 5)
-		} else if describeLogStreamsRequestPage.NextToken == nil {
+		if !found && describeLogStreamsRequestIter.Err() == nil {
 			break
 		}
 	}
-	return logStreamNames
+	logger.Println()
+	return logStreamNames, nil
 }
 
+type Msg []cloudwatchlogs.FilteredLogEvent
+
+func (m Msg) Len() int           { return len(m) }
+func (m Msg) Swap(i, j int)      { m[i], m[j] = m[j], m[i] }
+func (m Msg) Less(i, j int) bool { return *m[i].IngestionTime < *m[j].IngestionTime }
+
 func main() {
-	stscreds.DefaultDuration = time.Minute * 60
+
+	var logger = log.New(os.Stderr, "", 0)
+
 	profileInput := flag.String("profile", "", "An AWS credential profile (refer to https://docs.aws.amazon.com/cli/latest/userguide/cli-multiple-profiles.html)")
 	regionInput := flag.String("region", "us-east-1", "The AWS region associated with the target log group")
 	logGroupNameInput := flag.String("log-group-name", "", "An AWS log group that may or may not exist at runtime (polling will continue to occur)")
+
 	logStreamLikeInput := flag.String("log-stream-like", "*", "Target log stream names that match this expression")
 	logStreamRefreshInput := flag.Bool("log-stream-refresh", false, "Perform refreshes of target log streams")
 	filterPatternInput := flag.String("filter-pattern", "", "A valid CloudWatch log filter (refer to https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/FilterAndPatternSyntax.html)")
+	logStreamPrefix := flag.String("stream-prefix", "", "Prefix with your stream name, much faster filter...")
+
 	startTimeInput := flag.String("start-time", time.Now().UTC().Format("2006-01-02T15:04:05Z"), "Events that occurred after this time are returned")
 	endTimeInput := flag.String("end-time", "", "Events that occurred at or before this time are returned")
+
 	helpInput := flag.Bool("help", false, "Show usage message")
 	flag.Parse()
+
 	if *logGroupNameInput == "" || *logStreamLikeInput == "" || *helpInput {
-		flag.PrintDefaults()
-		os.Exit(1)
+		flag.Usage()
+		logger.Fatal("Stopping")
 	}
 
-	logStreamMatcher := regexp.MustCompile(strings.Replace(*logStreamLikeInput, "*", ".*", -1))
-
-	startTime, _ := time.Parse(time.RFC3339, *startTimeInput)
-
-	cfg, _ := external.LoadDefaultAWSConfig(
+	cfg, err := external.LoadDefaultAWSConfig(
 		external.WithMFATokenFunc(stscreds.StdinTokenProvider),
 		external.WithSharedConfigProfile(*profileInput),
 		external.WithRegion(*regionInput),
 	)
-
-	if &cfg != nil && getCredentials(cfg) {
-		logsClient = *cloudwatchlogs.New(cfg)
-	} else {
-		additionalProfileHelp := ""
-		if *profileInput != "" {
-			additionalProfileHelp = " Ensure that your credential profile \"" + *profileInput + "\" has been properly configured (refer to https://docs.aws.amazon.com/cli/latest/userguide/cli-multiple-profiles.html)."
-		}
-		fmt.Println("Bad credentials were provided." + additionalProfileHelp)
-		os.Exit(1)
+	if err != nil {
+		logger.Fatalf("Failed LoadDefaultAWSConfig: %s", err.Error())
 	}
 
-	startTimeUnix := startTime.UTC().Unix() * 1000
-	initialStartTimeUnix := startTimeUnix
+	if err := checkCredentials(cfg); err != nil {
+		logger.Fatalf(`Ensure that your credential profile %s has been properly configured (refer to https://docs.aws.amazon.com/cli/latest/userguide/cli-multiple-profiles.html).`, *profileInput)
+	}
 
-	filterLogEventsInput := cloudwatchlogs.FilterLogEventsInput{LogGroupName: logGroupNameInput, StartTime: &startTimeUnix}
-	if *filterPatternInput != "" {
+	logsClient := cloudwatchlogs.New(cfg)
+
+	logStreamMatcher := regexp.MustCompile(strings.Replace(*logStreamLikeInput, "*", ".*", -1))
+
+	stscreds.DefaultDuration = time.Minute * 60
+
+	var startTime time.Time // From parameters
+	var endTime time.Time   // From parameters
+
+	var startTimeUnix int64 // milliseconds, working value
+	var endTimeUnix int64   // milliseconds, working value
+
+	startTime = toTime(*startTimeInput, time.Now())
+
+	endTime = toTime(*endTimeInput, startTime.Add(24 * time.Hour))
+
+	startTimeUnix = startTime.UTC().UnixNano() / (1000 * 1000)
+	endTimeUnix = endTime.UTC().UnixNano() / (1000 * 1000)
+
+	filterLogEventsInput := cloudwatchlogs.FilterLogEventsInput{LogGroupName: logGroupNameInput, StartTime: &startTimeUnix, EndTime: &endTimeUnix}
+	if len(*filterPatternInput) > 0 {
 		filterLogEventsInput.FilterPattern = filterPatternInput
 	}
 
-	var endTimeUnix int64
-	if *endTimeInput != "" {
-		endTime, _ := time.Parse(time.RFC3339, *endTimeInput)
-		endTimeUnix = endTime.UTC().Unix() * 1000
-	} else {
-		endTimeUnix = time.Now().UTC().Unix() * 1000 + timeOffset
-	}
-	filterLogEventsInput.EndTime = &endTimeUnix
+	c := make(chan os.Signal, 100)
+	signal.Notify(c, syscall.SIGUSR1)
 
-	var filterLogEventsError error
-	logStreamNames := getLogStreams(*logGroupNameInput, *logStreamMatcher, initialStartTimeUnix, endTimeUnix)
-	for 0 < len(logStreamNames) || *endTimeInput == "" {
-		for i := 0; i < len(logStreamNames); i += 100 {
-			endOfRange := i + 99
-			if len(logStreamNames) - 1 < endOfRange {
-				endOfRange = i + (len(logStreamNames) % 100)
+	start := time.Time{}
+	for {
+
+		select {
+		case sig := <-c:
+			if sig == syscall.SIGUSR1 {
+				logger.Println("Restarting")
+				start = time.Time{}
 			}
-			filterLogEventsInput.LogStreamNames = logStreamNames[i:endOfRange]
-			filterLogEventsRequest := logsClient.FilterLogEventsRequest(&filterLogEventsInput)
-			filterLogEventsRequestIter := filterLogEventsRequest.Paginate()
+		default:
+		}
+
+		if time.Since(start) > (5 * time.Minute) {
+			start = time.Now()
+			filterLogEventsInput.LogStreamNames, err = getLogStreams(logger, logsClient, *logGroupNameInput, *logStreamMatcher, *logStreamPrefix, startTimeUnix)
+		}
+		filterLogEventsRequest := logsClient.FilterLogEventsRequest(&filterLogEventsInput)
+		filterLogEventsRequestIter := filterLogEventsRequest.Paginate()
+
+		all := make(chan cloudwatchlogs.FilteredLogEvent)
+		go func(filterLogEventsRequestIter *cloudwatchlogs.FilterLogEventsPager) {
+			defer close(all)
 			for filterLogEventsRequestIter.Next() {
-				waitGroup.Add(1)
-				go func(filterLogEventsOutput cloudwatchlogs.FilterLogEventsOutput) {
-					defer waitGroup.Done()
-					for _, item := range filterLogEventsOutput.Events {
-						logger.Print(time.Unix(0, *item.Timestamp * int64(time.Millisecond)).UTC().Format("2006-01-02T15:04:05Z") + "\t" + *item.LogStreamName + "\t" + *item.Message)
-					}
-				}(*filterLogEventsRequestIter.CurrentPage())
+				filterLogEventsOutput := *filterLogEventsRequestIter.CurrentPage()
+				for _, item := range filterLogEventsOutput.Events {
+					all <- item
+				}
 			}
-			filterLogEventsError = filterLogEventsRequestIter.Err()
-			if filterLogEventsError != nil {
-				break
+		}(&filterLogEventsRequestIter)
+
+		var latest int64
+		var output = []cloudwatchlogs.FilteredLogEvent{}
+		for row := range all {
+			if *row.Timestamp > latest {
+				latest = *row.Timestamp
 			}
+			output = append(output, row)
 		}
-		waitGroup.Wait()
-		if filterLogEventsError == nil && *endTimeInput == "" {
-			startTimeUnix = endTimeUnix + 1000
-			for endTimeUnix <= startTimeUnix {
-				time.Sleep(time.Second)
-				endTimeUnix = (endTimeUnix * 1000) + timeOffset + 1000
-			}
-			filterLogEventsInput.StartTime = &startTimeUnix
-			filterLogEventsInput.EndTime = &endTimeUnix
-			if *logStreamRefreshInput {
-				logStreamNames = getLogStreams(*logGroupNameInput, *logStreamMatcher, initialStartTimeUnix, endTimeUnix)
-			}
-		} else {
-			break
+
+		sort.Sort(Msg(output))
+		for _, o := range output {
+			p := strings.Split(*o.LogStreamName, "/")
+			logger.Printf("%-30s  %s\n", strings.Join(p[:1], "/"), *o.Message)
 		}
+
+		err = filterLogEventsRequestIter.Err()
+		if err != nil {
+			logger.Printf("Error paging: %s", err.Error())
+			continue
+		}
+
+		if !endTime.IsZero() && (endTime.UnixNano()/(1000*1000)) <= latest {
+			return
+		}
+
+		if len(output) == 0 {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		startTimeUnix = latest + 1
+
+		filterLogEventsInput.StartTime = &startTimeUnix
+
+		if !*logStreamRefreshInput {
+			return
+		}
+
+		filterLogEventsInput.EndTime = &endTimeUnix
 	}
+}
+func toTime(in string, def time.Time) time.Time {
+	t, err := time.Parse(time.RFC3339, in)
+	if err != nil {
+		t, err = time.Parse("2006-01-02 15:04:05.999", in)
+	}
+	if err != nil {
+		t = def
+	}
+	return t
 }
