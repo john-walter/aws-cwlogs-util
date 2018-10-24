@@ -138,7 +138,7 @@ func main() {
 	endTime = toTime(*endTimeInput, startTime.Add(24*time.Hour))
 
 	startTimeUnix = startTime.UTC().UnixNano() / (1000 * 1000)
-	endTimeUnix = endTime.UTC().UnixNano() / (1000 * 1000)
+	endTimeUnix = (endTime.UTC().UnixNano() / (1000 * 1000)) + int64(5 * 1000)
 
 	if *showInput {
 		fmt.Printf("Using:  Start: %s; End: %s\n", startTime.Format(time.RFC3339Nano), endTime.Format(time.RFC3339Nano))
@@ -156,6 +156,8 @@ func main() {
 	signal.Notify(c, syscall.SIGUSR1)
 
 	start := time.Time{}
+	var latest int64
+
 	for {
 
 		select {
@@ -189,7 +191,6 @@ func main() {
 			}
 		}(&filterLogEventsRequestIter)
 
-		var latest int64
 		var output []cloudwatchlogs.FilteredLogEvent
 		for row := range all {
 			if *row.Timestamp > latest {
@@ -200,8 +201,10 @@ func main() {
 
 		sort.Sort(msg(output))
 		for _, o := range output {
-			p := strings.Split(*o.LogStreamName, "/")
-			logger.Printf("%-30s  %s\n", strings.Join(p[:1], "/"), *o.Message)
+			if *o.Timestamp <= (endTime.Unix() * 1000) {
+				p := strings.Split(*o.LogStreamName, "/")
+				logger.Printf("%-30s  %s\n", strings.Join(p[:1], "/"), *o.Message)
+			}
 		}
 
 		err = filterLogEventsRequestIter.Err()
