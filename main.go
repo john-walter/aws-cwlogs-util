@@ -26,37 +26,34 @@ func checkCredentials(cfg aws.Config) error {
 	return err
 }
 
-func getLogStreams(logger *log.Logger, logsClient *cloudwatchlogs.CloudWatchLogs, logGroupName string, logStreamMatcher *regexp.Regexp, logStreamPrefix string, initialStartTime int64) ([]string, error) {
+func getLogStreams(logger *log.Logger, logsClient *cloudwatchlogs.CloudWatchLogs, logGroupName string, logStreamMatcher *regexp.Regexp, initialStartTime int64) ([]string, error) {
 	var logStreamNames []string
 	logStreamMinTimestamp := initialStartTime - int64(3*60*60*1000) // 3 hour
-	describeLogStreamsInput := cloudwatchlogs.DescribeLogStreamsInput{LogGroupName: &logGroupName}
-	if len(logStreamPrefix) != 0 {
-		describeLogStreamsInput.LogStreamNamePrefix = &logStreamPrefix
-	} else {
-		var trueRef = true
-
-		describeLogStreamsInput.OrderBy = cloudwatchlogs.OrderByLastEventTime
-		describeLogStreamsInput.Descending = &trueRef
-	}
+	var trueRef = true
+	describeLogStreamsInput := cloudwatchlogs.DescribeLogStreamsInput{LogGroupName: &logGroupName, OrderBy: cloudwatchlogs.OrderByLastEventTime, Descending: &trueRef}
 	describeLogStreamsRequest := logsClient.DescribeLogStreamsRequest(&describeLogStreamsInput)
 	describeLogStreamsRequestIter := describeLogStreamsRequest.Paginate()
 
 	logger.Print("Fetching new set of streams")
 	// keep trying to receive log stream names until we complete a pagination cycle with no errors
 	matched := map[string]bool{}
+
+loop:
 	for {
 		found := false
 		for describeLogStreamsRequestIter.Next() {
 			fmt.Printf(".")
 			for _, item := range describeLogStreamsRequestIter.CurrentPage().LogStreams {
-				// include any log streams that start in last 3 hours, or finished after start time
-				if logStreamMinTimestamp <= *item.FirstEventTimestamp || *item.LastEventTimestamp >= initialStartTime {
+				if logStreamMinTimestamp <= *item.LastEventTimestamp {
 					logStreamMatches := logStreamMatcher.FindAllStringIndex(*item.LogStreamName, -1)
 					if 0 < len(logStreamMatches) && !matched[*item.LogStreamName] {
 						logStreamNames = append(logStreamNames, *item.LogStreamName)
 						matched[*item.LogStreamName] = true
 						found = true
 					}
+				}
+				if logStreamMinTimestamp > *item.LastEventTimestamp {
+					break loop
 				}
 			}
 			if describeLogStreamsRequestIter.Err() != nil {
@@ -68,7 +65,10 @@ func getLogStreams(logger *log.Logger, logsClient *cloudwatchlogs.CloudWatchLogs
 			break
 		}
 	}
-	logger.Println()
+	logger.Print()
+	for _, name := range logStreamNames {
+		logger.Println(name)
+	}
 	return logStreamNames, nil
 }
 
@@ -89,13 +89,19 @@ func main() {
 	logStreamLikeInput := flag.String("log-stream-like", "*", "Target log stream names that match this expression")
 	logStreamRefreshInput := flag.Bool("log-stream-refresh", false, "Perform refreshes of target log streams")
 	filterPatternInput := flag.String("filter-pattern", "", "A valid CloudWatch log filter (refer to https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/FilterAndPatternSyntax.html)")
-	logStreamPrefix := flag.String("stream-prefix", "", "Prefix with your stream name, much faster filter...")
 
 	startTimeInput := flag.String("start-time", time.Now().UTC().Format("2006-01-02T15:04:05Z"), "Events that occurred after this time are returned")
 	endTimeInput := flag.String("end-time", "", "Events that occurred at or before this time are returned")
 
 	helpInput := flag.Bool("help", false, "Show usage message")
+	showInput := flag.Bool("show", false, "Show input data")
 	flag.Parse()
+
+	if *showInput {
+		logger.Printf("Profile: %s\tRegion: %s\tLog Group: %s\n", *profileInput, *regionInput, *logGroupNameInput)
+		logger.Printf("Stream Like: %s\tPattern: %s\n", *logStreamLikeInput, *filterPatternInput)
+		logger.Printf("Start: [%s], End: [%s]\n", *startTimeInput, *endTimeInput)
+	}
 
 	if *logGroupNameInput == "" || *logStreamLikeInput == "" || *helpInput {
 		flag.Usage()
@@ -134,6 +140,13 @@ func main() {
 	startTimeUnix = startTime.UTC().UnixNano() / (1000 * 1000)
 	endTimeUnix = endTime.UTC().UnixNano() / (1000 * 1000)
 
+	if *showInput {
+		fmt.Printf("Using:  Start: %s; End: %s\n", startTime.Format(time.RFC3339Nano), endTime.Format(time.RFC3339Nano))
+		s := time.Unix(0, startTimeUnix*(1000*1000))
+		e := time.Unix(0, endTimeUnix*(1000*1000))
+		fmt.Printf("Within: Start: %s; End: %s\n\n", s.Format(time.RFC3339Nano), e.Format(time.RFC3339Nano))
+	}
+
 	filterLogEventsInput := cloudwatchlogs.FilterLogEventsInput{LogGroupName: logGroupNameInput, StartTime: &startTimeUnix, EndTime: &endTimeUnix}
 	if len(*filterPatternInput) > 0 {
 		filterLogEventsInput.FilterPattern = filterPatternInput
@@ -156,7 +169,7 @@ func main() {
 
 		if time.Since(start) > (5 * time.Minute) {
 			start = time.Now()
-			filterLogEventsInput.LogStreamNames, err = getLogStreams(logger, logsClient, *logGroupNameInput, logStreamMatcher, *logStreamPrefix, startTimeUnix)
+			filterLogEventsInput.LogStreamNames, err = getLogStreams(logger, logsClient, *logGroupNameInput, logStreamMatcher, startTimeUnix)
 			if err != nil {
 				time.Sleep(5 * time.Second)
 				continue
