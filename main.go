@@ -183,7 +183,8 @@ func main() {
 		all := make(chan cloudwatchlogs.FilteredLogEvent)
 		go func(filterLogEventsRequestIter *cloudwatchlogs.FilterLogEventsPager) {
 			defer close(all)
-			for filterLogEventsRequestIter.Next() {
+			iter := filterLogEventsRequestIter
+			for iter.Next() {
 				filterLogEventsOutput := *filterLogEventsRequestIter.CurrentPage()
 				for _, item := range filterLogEventsOutput.Events {
 					all <- item
